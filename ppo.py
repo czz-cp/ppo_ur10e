@@ -84,51 +84,24 @@ except ImportError:
 
 class ActorNetwork(nn.Module):
     """
-    Actor网络（策略网络）
+    Actor网络（策略网络）- 简化版本
 
-    基于Isaac训练模式设计的深度网络架构
-    专为UR10e轨迹规划任务优化
+    专为RL-PID混合控制任务优化，简洁高效
     """
-    def __init__(self, state_dim: int = 25, action_dim: int = 6, hidden_dim: int = 256):
+    def __init__(self, state_dim: int = 16, action_dim: int = 3, hidden_dim: int = 64):
         super().__init__()
 
-        # 特征提取网络 - 深层架构
-        self.feature_extractor = nn.Sequential(
-            # 第一层：状态→特征
+        # 简单的MLP网络
+        self.policy_net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.LeakyReLU(0.1),  # LeakyReLU比Tanh更适合梯度流
-            nn.LayerNorm(hidden_dim),  # 添加LayerNorm稳定训练
-
-            # 第二层：特征扩展
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.1),
-            nn.LayerNorm(hidden_dim),
-
-            # 第三层：特征压缩
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LeakyReLU(0.1),
-            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, action_dim * 2)  # 输出均值和log_std
         )
 
-        # 策略头 - 输出均值
-        self.policy_mean = nn.Sequential(
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.LeakyReLU(0.1),
-            nn.LayerNorm(hidden_dim // 4),
-            nn.Linear(hidden_dim // 4, action_dim)
-        )
-
-        # 策略头 - 输出标准差
-        self.policy_std = nn.Sequential(
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.LeakyReLU(0.1),
-            nn.LayerNorm(hidden_dim // 4),
-            nn.Linear(hidden_dim // 4, action_dim)
-        )
-
-        # 可学习的log_std缩放参数
-        self.log_std_min = -2.0
-        self.log_std_max = 0.5
+        # 可学习的log_std参数（固定初始值）
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
 
         # 初始化权重
         self._init_weights()
@@ -159,16 +132,16 @@ class ActorNetwork(nn.Module):
             print("⚠️  输入状态包含NaN值!")
             state = torch.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # 特征提取
-        features = self.feature_extractor(state)
+        # 前向传播
+        output = self.policy_net(state)
 
-        # 分别计算均值和标准差
-        mean = self.policy_mean(features)
-        log_std = self.policy_std(features)
+        # 分离均值和log_std
+        mean = output[..., :3]
+        log_std = output[..., 3:]
 
-        # 限制log_std范围和数值稳定性
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        mean = torch.clamp(mean, -10.0, 10.0)  # 限制均值范围
+        # 限制log_std范围，使用可学习参数
+        log_std = torch.clamp(log_std, -2.0, 0.5) + self.log_std
+        mean = torch.clamp(mean, -1.0, 1.0)  # 限制均值范围
 
         return mean, log_std
 
@@ -254,7 +227,7 @@ class ActorNetwork(nn.Module):
         Returns:
             log_prob: [batch_size] 动作的对数概率
             entropy: [batch_size] 策略熵
-        """
+        """ 
         mean, log_std = self.forward(state)
 
         # 关键检查：检查mean和log_std是否有效
@@ -323,40 +296,20 @@ class ActorNetwork(nn.Module):
 
 class CriticNetwork(nn.Module):
     """
-    Critic网络（价值函数网络）
+    Critic网络（价值函数网络）- 简化版本
 
-    基于Isaac训练模式设计的深度价值网络
-    专为UR10e轨迹规划状态价值评估优化
+    专为RL-PID混合控制任务优化，简洁高效
     """
-    def __init__(self, state_dim: int = 25, hidden_dim: int = 256):
+    def __init__(self, state_dim: int = 16, hidden_dim: int = 64):
         super().__init__()
 
-        # 特征提取网络 - 与Actor共享架构思路
-        self.feature_extractor = nn.Sequential(
-            # 第一层：状态→特征
+        # 简单的MLP网络
+        self.value_net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.LeakyReLU(0.1),
-            nn.LayerNorm(hidden_dim),
-
-            # 第二层：特征扩展
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.1),
-            nn.LayerNorm(hidden_dim),
-
-            # 第三层：特征压缩
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LeakyReLU(0.1),
-            nn.LayerNorm(hidden_dim // 2),
-        )
-
-        # 价值头 - 深层架构
-        self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.LeakyReLU(0.1),
-            nn.LayerNorm(hidden_dim // 4),
-            nn.Linear(hidden_dim // 4, hidden_dim // 8),
-            nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim // 8, 1)  # 输出单一价值
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)  # 输出状态价值
         )
 
         # 初始化权重
@@ -387,14 +340,11 @@ class CriticNetwork(nn.Module):
             print("⚠️  Critic输入状态包含NaN值!")
             state = torch.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # 特征提取
-        features = self.feature_extractor(state)
-
-        # 价值预测
-        value = self.value_head(features).squeeze(-1)
+        # 简单前向传播
+        value = self.value_net(state).squeeze(-1)
 
         # 数值稳定性
-        value = torch.clamp(value, -1000.0, 1000.0)  # 防止极端值
+        value = torch.clamp(value, -100.0, 100.0)  # 防止极端值
 
         return value
 
@@ -405,7 +355,7 @@ class PPO:
 
     Proximal Policy Optimization，专门针对UR10e轨迹规划任务优化
     """
-    def __init__(self, state_dim: int = 25, action_dim: int = 6,
+    def __init__(self, state_dim: int = 16, action_dim: int = 3,
                  lr_actor: float = 3e-4, lr_critic: float = 1e-3,
                  clip_eps: float = 0.2, gamma: float = 0.99, gae_lambda: float = 0.95,
                  entropy_coef: float = 0.01, value_coef: float = 0.5,

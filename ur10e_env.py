@@ -4,7 +4,7 @@ UR10e PPO 多目标最优轨迹规划环���
 基于论文《基于深度强化学习的机械臂多目标最优轨迹规划》
 实现了论文中设计的25维状态空间和多目标奖励函数
 
-状态空间设计（25维）：
+状态空间设计（16维 - RL-PID混合控制）：
 - θ_start: 起始关节角（6维）
 - p_c: 末端当前位置（3维）
 - θ_end: 目标关节角（6维）
@@ -124,7 +124,7 @@ class UR10ePPOEnv:
         # 状态变量
         self.current_step = 0
         self.start_joint_angles = None
-        self.target_joint_angles = None
+        # self.target_joint_angles = None  # RL-PID混合控制不需要
         self.target_pos = None
         self.prev_joint_angles = None
         self.prev_joint_velocities = None
@@ -153,8 +153,8 @@ class UR10ePPOEnv:
         self._setup_pd_controller()
 
         print(f"UR10e PPO环境初始化完成")
-        print(f"状态空间: 25维")
-        print(f"动作空间: 6维 (关节角速度)")
+        print(f"状态空间: 16维 (RL-PID混合控制状态)")
+        print(f"动作空间: 3维 (PID参数调度)")
         print(f"最大步数: {self.max_steps}")
         print(f"奖励函数: 多目标 (精度 + 平滑性 + 能耗)")
 
@@ -241,6 +241,212 @@ class UR10ePPOEnv:
 
         return control_torques
 
+    def _rl_pid_control(self, current_angles: np.ndarray, current_velocities: np.ndarray,
+                       kp_scale: float, kd_scale: float, ki_enable: float) -> np.ndarray:
+        """
+        RL调度的PID控制器 - 重新设计
+
+        Args:
+            current_angles: [6] 当前关节角度
+            current_velocities: [6] 当前关节速度
+            kp_scale: P增益缩放因子 [-0.5, 0.5]
+            kd_scale: D增益缩放因子 [-0.5, 0.5]
+            ki_enable: 积分控制启用标志 [0, 1]
+
+        Returns:
+            control_torques: [6] 控制力矩
+        """
+        control_torques = np.zeros(6)
+
+        # 初始化积分误差累积（如果需要）
+        if not hasattr(self, 'error_integral'):
+            self.error_integral = np.zeros(6)
+
+        # 基于当前位置到目标位置的启发式控制
+        # 使用雅可比的近似版本：将末端位置误差映射到关节误差
+        if hasattr(self, 'target_pos') and self.target_pos is not None:
+            current_end_pos = self.data.site_xpos[0].copy()
+            end_effector_error = self.target_pos - current_end_pos
+
+            # 简化的雅可比映射：将末端误差分配到各关节
+            # 这是一个启发式方法，实际应用中可以使用更精确的雅可比计算
+            position_error = np.zeros(6)
+
+            # 将XYZ误差映射到关节空间（简化的启发式映射）
+            position_error[0] = end_effector_error[0] * 0.5  # shoulder_pan
+            position_error[1] = end_effector_error[1] * 0.5  # shoulder_lift
+            position_error[2] = end_effector_error[2] * 0.5  # elbow
+            position_error[3] = (end_effector_error[0] + end_effector_error[1]) * 0.3  # wrist_1
+            position_error[4] = (end_effector_error[1] + end_effector_error[2]) * 0.3  # wrist_2
+            position_error[5] = np.linalg.norm(end_effector_error) * 0.2  # wrist_3
+        else:
+            # 如果没有目标，只做阻尼控制
+            position_error = np.zeros(6)
+
+        for i in range(6):
+            # 基础PID参数
+            if i < 3:  # 关节1-3
+                base_p_gain = 6500.0
+            else:       # 关节4-6
+                base_p_gain = 5000.0
+            base_d_gain = 200.0
+            base_i_gain = 10.0  # 小的积分增益
+
+            # RL调度参数调整
+            p_gain = base_p_gain * (1.0 + kp_scale)  # ±50%调整范围
+            d_gain = base_d_gain * (1.0 + kd_scale)  # ±50%调整范围
+            i_gain = base_i_gain * ki_enable        # 0或启用
+
+            # 速度误差（期望速度为0）
+            velocity_error = -current_velocities[i]
+
+            # 更新积分误差（抗饱和）
+            if ki_enable > 0.5:  # 启用积分控制
+                self.error_integral[i] += position_error[i] * self.dt
+                # 积分抗饱和
+                self.error_integral[i] = np.clip(self.error_integral[i], -0.5, 0.5)
+            else:
+                self.error_integral[i] *= 0.95  # 缓慢衰减积分项
+
+            # PID控制公式
+            control_torques[i] = (
+                p_gain * position_error[i] +          # 比例项
+                d_gain * velocity_error +              # 微分项
+                i_gain * self.error_integral[i]        # 积分项
+            )
+
+        return control_torques
+
+    def _compute_hybrid_control_reward(self, action: np.ndarray, current_angles: np.ndarray,
+                                     current_velocities: np.ndarray, current_end_pos: np.ndarray,
+                                     target_pos: np.ndarray) -> Tuple[float, Dict[str, float]]:
+        """
+        计算混合控制奖励函数
+
+        Args:
+            action: 3维PID调度动作
+            current_angles: 当前关节角度
+            current_velocities: 当前关节速度
+            current_end_pos: 当前末端位置
+            target_pos: 目标位置
+
+        Returns:
+            reward: 总奖励值
+            reward_components: 各项奖励组件
+        """
+        # 1. 控制精度奖励 (最重要)
+        position_error = np.linalg.norm(target_pos - current_end_pos)
+        accuracy_reward = -self.reward_config['accuracy']['weight'] * position_error
+
+        # 2. 控制稳定性奖励 (参数变化不能太剧烈)
+        kp_scale, kd_scale, ki_enable = action
+        stability_reward = -self.reward_config.get('stability', {}).get('weight', 0.1) * (
+            abs(kp_scale) + abs(kd_scale)
+        )
+
+        # 3. 响应速度奖励 (鼓励快速收敛)
+        if hasattr(self, 'prev_position_error'):
+            error_change = self.prev_position_error - position_error
+            speed_reward = self.reward_config.get('speed', {}).get('weight', 0.05) * max(0, error_change)
+        else:
+            speed_reward = 0.0
+        self.prev_position_error = position_error
+
+        # 4. 能耗效率奖励
+        energy_cost = np.sum(current_velocities**2)
+        energy_reward = -self.reward_config.get('energy', {}).get('weight', 0.001) * energy_cost
+
+        # 总奖励
+        total_reward = accuracy_reward + stability_reward + speed_reward + energy_reward
+
+        # 成功奖励
+        if position_error < self.reward_config['accuracy']['threshold']:
+            total_reward += self.reward_config['extra']['success_reward']
+
+        reward_components = {
+            'accuracy': accuracy_reward,
+            'stability': stability_reward,
+            'speed': speed_reward,
+            'energy': energy_reward,
+            'total': total_reward
+        }
+
+        return total_reward, reward_components
+
+    def _normalize_joint_positions(self, positions):
+        """关节位置归一化到[-1, 1]（基于UR10e实际限制）
+
+        Args:
+            positions: 关节角度 [6] in rad/s
+
+        Returns:
+            normalized: 归一化后的关节角度 [6] in [-1, 1]
+        """
+        # UR10e实际关节位置限制 (rad)
+        max_positions = np.array([
+            6.283,  # shoulder_pan: ±360° = ±2π rad
+            6.283,  # shoulder_lift: ±360° = ±2π rad
+            3.142,  # elbow_joint: ±180° = ±π rad (人工限制)
+            6.283,  # wrist_1: ±360° = ±2π rad
+            6.283,  # wrist_2: ±360° = ±2π rad
+            6.283   # wrist_3: ±360° = ±2π rad
+        ])
+
+        # 避免除零
+        normalized = np.divide(positions, max_positions,
+                             out=np.zeros_like(positions),
+                             where=max_positions!=0)
+
+        return np.clip(normalized, -1.0, 1.0)
+
+    def _normalize_joint_velocities(self, velocities):
+        """关节速度归一化到[-1, 1]（基于UR10e实际限制）
+
+        Args:
+            velocities: 关节速度 [6] in rad/s
+
+        Returns:
+            normalized: 归一化后的关节速度 [6] in [-1, 1]
+        """
+        # UR10e实际关节速度限制 (rad/s)
+        max_velocities = np.array([
+            2.094,  # shoulder_pan_joint: 120°/s = 2.094 rad/s
+            2.094,  # shoulder_lift_joint: 120°/s = 2.094 rad/s
+            3.142,  # elbow_joint: 180°/s = π rad/s
+            3.142,  # wrist_1_joint: 180°/s = π rad/s
+            3.142,  # wrist_2_joint: 180°/s = π rad/s
+            3.142   # wrist_3_joint: 180°/s = π rad/s
+        ])
+
+        # 避免除零
+        normalized = np.divide(velocities, max_velocities,
+                             out=np.zeros_like(velocities),
+                             where=max_velocities!=0)
+
+        return np.clip(normalized, -1.0, 1.0)
+
+    def _normalize_position_error(self, position_error):
+        """位置误差归一化到[-1, 1]
+
+        Args:
+            position_error: 位置误差 [3] in [-1, 1] meters
+
+        Returns:
+            normalized: 归一化后的位置误差 [3] in [-1, 1]
+        """
+        return np.clip(position_error / 1.0, -1.0, 1.0)  # 假设最大误差1米
+
+    def _normalize_distance(self, distance):
+        """距离归一化到[0, 1]
+
+        Args:
+            distance: 欧式距离 in [0, 2] meters
+
+        Returns:
+            normalized: 归一化后的距离 in [0, 1]
+        """
+        return np.clip(distance / 2.0, 0.0, 1.0)  # 假设最大距离2米
+
     def _keyboard_callback(self, window, key, scancode, act, mods):
         """键盘回调"""
         if act == glfw.PRESS and key == glfw.KEY_BACKSPACE:
@@ -267,7 +473,7 @@ class UR10ePPOEnv:
         重置环境
 
         Returns:
-            state: 25维状态向量
+            state: 16维状态向量 (RL-PID混合控制)
         """
         # 重置MuJoCo状态
         mj.mj_resetData(self.model, self.data)
@@ -278,8 +484,8 @@ class UR10ePPOEnv:
         # 随机生成目标位置
         self.target_pos = self._sample_random_target_pos()
 
-        # 计算目标关节角度（逆运动学简化版本）
-        self.target_joint_angles = self._compute_target_joint_angles(self.target_pos)
+        # RL-PID混合控制：不需要目标关节角度，RL会动态调整PID参数
+        # self.target_joint_angles = self._compute_target_joint_angles(self.target_pos)
 
         # 设置起始位置
         for i in range(6):
@@ -314,7 +520,8 @@ class UR10ePPOEnv:
         z = np.random.uniform(self.target_pos_range['z'][0], self.target_pos_range['z'][1])
         return np.array([x, y, z])
 
-    def _compute_target_joint_angles(self, target_pos: np.ndarray) -> np.ndarray:
+    # RL-PID混合控制：不再需要逆运动学计算
+    # def _compute_target_joint_angles(self, target_pos: np.ndarray) -> np.ndarray:
         """
         计算目标关节角度（使用改进的逆运动学）
 
@@ -407,11 +614,12 @@ class UR10ePPOEnv:
 
     def _get_state(self) -> np.ndarray:
         """
-        获取当前状态（25维）
+        获取当前状态（RL-PID混合控制，16维）
 
         Returns:
-            state: 25维状态向量
-                [θ_start(6), p_c(3), θ_end(6), p_d(3), d_e(1), current_joint_velocities(6)]
+            state: 16维状态向量
+                [current_angles(6), current_velocities(6),
+                 position_error(3), distance_to_target(1)]
         """
         try:
             # 获取当前关节角度
@@ -429,63 +637,54 @@ class UR10ePPOEnv:
             if np.isnan(current_joint_velocities).any():
                 current_joint_velocities = np.zeros(6)
 
-            # 计算当前位置与目标位置的欧氏距离
-            try:
-                distance_to_target = np.linalg.norm(self.target_pos - current_end_pos)
-                if np.isnan(distance_to_target) or np.isinf(distance_to_target):
-                    distance_to_target = 1.0
-            except:
-                distance_to_target = 1.0
-
-            # 验证其他状态组件
-            if np.isnan(self.start_joint_angles).any():
-                start_angles = np.zeros(6)
-            else:
-                start_angles = self.start_joint_angles
-
-            if np.isnan(self.target_joint_angles).any():
-                target_angles = np.zeros(6)
-            else:
-                target_angles = self.target_joint_angles
-
-            if np.isnan(self.target_pos).any():
+            # 验证目标位置
+            if self.target_pos is None or np.isnan(self.target_pos).any():
                 target_pos = np.zeros(3)
             else:
                 target_pos = self.target_pos
 
-            # 构建25维状态向量
-            state = np.concatenate([
-                start_angles,                # θ_start: 起始关节角（6维）
-                current_end_pos,            # p_c: 末端当前位置（3维）
-                target_angles,              # θ_end: 目标关节角（6维）
-                target_pos,                 # p_d: 末端目标位置（3维）
-                [distance_to_target],       # d_e: 当前位置与目标位置的欧氏距离（1维）
-                current_joint_velocities    # 当前关节速度（6维）
+            # 计算位置误差（3维）
+            position_error = target_pos - current_end_pos
+
+            # 计算欧氏距离
+            distance_to_target = np.linalg.norm(position_error)
+            if np.isnan(distance_to_target) or np.isinf(distance_to_target):
+                distance_to_target = 1.0
+
+            # 构建16维状态向量（归一化）
+            normalized_state = np.concatenate([
+                self._normalize_joint_positions(current_joint_angles),    # 关节位置归一化 [-1,1]
+                self._normalize_joint_velocities(current_joint_velocities), # 关节速度归一化 [-1,1]
+                self._normalize_position_error(position_error),          # 位置误差归一化 [-1,1]
+                [self._normalize_distance(distance_to_target)]            # 距离归一化 [0,1] (包装为数组)
             ])
 
             # 数值稳定性检查
-            if np.isnan(state).any() or np.isinf(state).any():
-                print("⚠️  状态包含NaN或Inf值，使用零向量")
-                state = np.zeros(25)
+            if np.isnan(normalized_state).any() or np.isinf(normalized_state).any():
+                print("⚠️  归一化状态包含NaN或Inf值，使用零向量")
+                return np.zeros(16)
 
-            # 限制状态范围防止数值问题
-            state = np.clip(state, -5.0, 5.0)
-
-            return state
+            return normalized_state
 
         except Exception as e:
             print(f"❌ 状态计算错误: {e}")
-            return np.zeros(25)
+            import traceback
+            traceback.print_exc()
+            return np.zeros(16)
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         """
-        执行一步动作
+        执行一步动作（RL-PID混合控制）
 
         Args:
-            action: 6维动作向量（关节角速度）
+            action: 3维PID调度向量
+                   [kp_scale, kd_scale, ki_enable]
+                   - kp_scale: P增益缩放因子 [-0.5, 0.5]
+                   - kd_scale: D增益缩放因子 [-0.5, 0.5]
+                   - ki_enable: 积分控制启用标志 [0, 1]
 
         Returns:
-            next_state: 下一状态（25维）
+            next_state: 下一状态（16维）
             reward: 奖励值
             done: 是否结束
             info: 额外信息
@@ -493,23 +692,27 @@ class UR10ePPOEnv:
         # 裁剪动作到允许范围
         action = np.clip(action, -self.action_bound, self.action_bound)
 
+        # 解析PID调度动作
+        kp_scale = action[0]  # P增益缩放因子
+        kd_scale = action[1]  # D增益缩放因子
+        ki_enable = max(0, action[2])  # 积分控制启用（确保非负）
+
         # 获取当前状态（用于奖励计算）
         current_joint_angles = self.data.qpos[:6].copy()
         current_joint_velocities = self.data.qvel[:6].copy()
         current_end_pos = self.data.site_xpos[0].copy()
 
-        # 计算奖励（使用多目标奖励函数）
-        reward, reward_components = self._compute_multi_objective_reward(
+        # 计算奖励（使用混合控制奖励函数）
+        reward, reward_components = self._compute_hybrid_control_reward(
             action, current_joint_angles, current_joint_velocities,
             current_end_pos, self.target_pos
         )
 
-        # 执行动作：设置PD控制器的目标位置
-        # 动作是角速度（弧度/秒），乘以时间步长得到角度增量
-        target_angles = current_joint_angles + action * self.dt  # 转换为角度增量
-
-        # 使用优化的PD控制器
-        control_torques = self._pd_control(target_angles)
+        # RL调度PID参数的控制器
+        control_torques = self._rl_pid_control(
+            current_joint_angles, current_joint_velocities,
+            kp_scale, kd_scale, ki_enable
+        )
         self.data.ctrl[:6] = control_torques
 
         # 执行仿真步

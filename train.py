@@ -218,11 +218,12 @@ def main():
 
     print(f"📝 配置已保存到 config.json")
     print(f"🔧 最大训练轮数: {config['train']['max_episodes']}")
-    print(f"🎯 状态空间: 25维")
-    print(f"⚡ 动作空间: 6维")
-    print(f"📏 Action Bound: {config['ppo'].get('action_bound', config['env'].get('action_bound', 0.03))}")
+    print(f"🎯 状态空间: {config['env'].get('state_dim', 16)}维 (RL-PID混合控制)")
+    print(f"⚡ 动作空间: {config['env'].get('action_dim', 3)}维 (PID参数调度)")
+    print(f"📏 Action Bound: {config['env']['action_bound']} (±50% PID参数调整)")
     print(f"⏱️  时间步长 dt: {config['env'].get('dt', 0.01)}s")
     print(f"📊 衰减回合机制: {'启用' if config['decay_episode']['enabled'] else '禁用'}")
+    print(f"🎛️  控制模式: RL调度PID参数")
     print("-" * 80)
 
     # 创建环境
@@ -237,8 +238,8 @@ def main():
     # 创建PPO智能体
     print("🧠 初始化PPO智能体...")
     agent = PPO(
-        state_dim=25,
-        action_dim=6,
+        state_dim=config['env'].get('state_dim', 16),
+        action_dim=config['env'].get('action_dim', 3),
         lr_actor=config['ppo']['lr_actor'],
         lr_critic=config['ppo']['lr_critic'],
         clip_eps=config['ppo']['clip_eps'],
