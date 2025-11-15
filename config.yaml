@@ -1,0 +1,184 @@
+# UR10e PPO 多目标最优轨迹规划配置文件
+# 基于论文《基于深度强化学习的机械臂多目标最优轨迹规划》
+
+# 环境配置
+env:
+  # UR10e模型路径
+  xml_path: "../universal_robots_ur10e/ur10e_mujoco/scene.xml"
+
+  # 仿真参数
+  max_steps: 1000              # 每个episode最大步数
+  dt: 0.01                    # 仿真时间步（秒）
+  enable_rendering: true      # 训练时关闭渲染以提高速度
+
+  # UR10e物理参数
+  joint_limits:                # UR10e关节限制 [min, max]（弧度）
+    - [-3.14159, 3.14159]      # shoulder_pan_joint
+    - [-3.14159, 3.14159]      # shoulder_lift_joint
+    - [-3.14159, 3.14159]      # elbow_joint
+    - [-3.14159, 3.14159]      # wrist_1_joint
+    - [-3.14159, 3.14159]      # wrist_2_joint
+    - [-3.14159, 3.14159]      # wrist_3_joint
+
+  # 动作空间配置
+  action_bound: 0.03         # 关节角速度限制（弧度/步）
+
+  # 目标位置范围（米） - 基于UR10e实际工作空间调整
+  target_pos_range:
+    x: [0.3, 1.2]              # X坐标范围（扩展到更合理的工作空间）
+    y: [-0.8, 0.8]             # Y坐标范围（扩展）
+    z: [0.1, 1.2]              # Z坐标范围（扩展到更高位置）
+
+# PPO算法配置
+ppo:
+  # 学习率配置 - 使用更保守的学习率防止数值不稳定
+  lr_actor: 0.0001               # Actor网络学习率（降低3倍）
+  lr_critic: 0.0001              # Critic网络学习率（降低2倍）
+
+  # PPO核心参数
+  clip_eps: 0.2                # PPO裁剪参数ε
+  gamma: 0.99                  # 折扣因子
+  gae_lambda: 0.95             # GAE的λ参数
+
+  # 损失函数权重
+  entropy_coef: 0.01           # 熵正则化系数
+  value_coef: 0.5              # 价值函数损失系数
+
+  # 优化器配置
+  max_grad_norm: 0.5           # 梯度裁剪范数
+
+  # 训练参数
+  epochs: 10                   # 每次更新训练轮数
+  batch_size: 64               # 批量大小
+
+# 多目标奖励函数配置（基于论文设计）
+reward:
+  # 精度奖励 r_a^t = -w_a * exp(σ_a * f_a(θ^t))
+  accuracy:
+    weight: 0.1                # w_a: 精度权重
+    sigma: 0.1                  # σ_a: 精度奖励的锐度参数
+    threshold: 0.005            # 精度阈值（米）
+
+  # 平滑性奖励 r_s^t = -w_s * sum(λ_v * q̇_k^2 + λ_acc * q̈_k^2)
+  smoothness:
+    weight: 0.1                 # w_s: 平滑性权重
+    lambda_vel: 1.0             # λ_v: 速度惩罚权重
+    lambda_acc: 0.5             # λ_acc: 加速度惩罚权重
+
+  # 能量消耗奖励 r_e^t = -w_e * sum((Δθ_k * τ_k)^2)
+  energy:
+    weight: 0.01                # w_e: 能量权重
+
+  # 额外奖励 r_ex^t（稀疏奖励）
+  extra:
+    success_reward: 10.0        # 成功到达目标的奖励
+
+# 衰减回合机制配置（论文创新点）
+decay_episode:
+  enabled: true                 # 是否启用衰减回合机制
+  initial_max_steps: 1000       # 初始最大步数
+  min_max_steps: 200            # 最小最大步数
+  success_threshold: 0.7        # 成功率阈值
+  decay_window: 200             # 成功率计算窗口
+  decay_step_size: 50           # 每次衰减的步数
+
+# 训练配置
+train:
+  # 基础训练参数
+  max_episodes: 50000           # 最大训练轮数
+  save_interval: 500            # 模型保存间隔
+  log_interval: 100             # 日志打印间隔
+  eval_interval: 1000           # 评估间隔
+
+  # 批量训练配置
+  rollout_length: 1000          # Rollout长度
+
+  # 检查点配置
+  checkpoint_dir: "./checkpoints"  # 模型检查点目录
+
+# Value Normalization配置
+value_normalization:
+  enabled: true                 # 是否启用值函数归一化
+  beta: 0.995                   # 指数移动平均系数
+  epsilon: 0.00000001            # 数值稳定性参数
+  clip_range: 10.0              # 归一化值裁剪范围
+
+# 评估配置
+evaluation:
+  enabled: true                 # 是否启用评估
+  eval_episodes: 100            # 评估episode数量
+  success_threshold: 0.005       # 成功阈值
+
+  # 评估指标
+  metrics:
+    - success_rate              # 成功率
+    - avg_episode_length        # 平均episode长度
+    - avg_reward               # 平均奖励
+    - trajectory_smoothness    # 轨迹平滑度
+    - final_position_error     # 最终位置误差
+
+# 日志和可视化配置
+logging:
+  # TensorBoard
+  use_tensorboard: false        # 是否使用TensorBoard
+  tensorboard_dir: "./logs"     # TensorBoard日志目录
+
+  # CSV输出
+  save_csv: true                # 是否保存CSV数据
+  csv_dir: "./csv_output"       # CSV数据目录
+
+  # 可视化
+  save_plots: true             # 是否保存训练曲线
+  plot_dir: "./plots"           # 训练曲线目录
+
+  # 轨迹可视化
+  save_trajectories: true       # 是否保存轨迹数据
+  trajectory_dir: "./trajectories"  # 轨迹数据目录
+
+# 随机种子
+seed: 42
+
+# 设备配置
+device:
+  gpu_id: 0                     # GPU设备ID（-1为CPU）
+  use_cuda: true                # 是否使用CUDA
+
+# 调试配置
+debug:
+  verbose: true                 # 详细输出
+  save_debug_info: false        # 是否保存调试信息
+  debug_dir: "./debug_output"   # 调试信息目录
+
+# 高级配置
+advanced:
+  # GAE配置
+  gae:
+    enabled: true               # 是否使用GAE
+    lambda: 0.95               # GAE的λ参数
+
+  # 学习率调度
+  lr_scheduler:
+    enabled: false              # 是否使用学习率调度
+    type: "cosine"             # 调度器类型
+    T_max: 10000               # 调度周期
+
+  # 优先经验回放
+  prioritized_replay:
+    enabled: false             # 是否使用优先经验回放
+    alpha: 0.6                # 优先级指数
+    beta: 0.4                 # 重要性采样权重
+
+  # 网络架构
+  network:
+    actor_hidden_layers: [256, 256, 256]  # Actor网络隐藏层
+    critic_hidden_layers: [256, 256, 256] # Critic网络隐藏层
+    activation: "relu"         # 激活函数
+
+  # 正则化
+  regularization:
+    dropout_rate: 0.1          # Dropout率
+    weight_decay: 0.0          # 权重衰减
+
+  # 经验回放缓冲区
+  replay_buffer:
+    size: 100000               # 缓冲区大小

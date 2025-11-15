@@ -1,0 +1,169 @@
+{
+  "env": {
+    "xml_path": "../universal_robots_ur10e/ur10e_mujoco/scene.xml",
+    "max_steps": 1000,
+    "dt": 0.01,
+    "enable_rendering": true,
+    "joint_limits": [
+      [
+        -3.14159,
+        3.14159
+      ],
+      [
+        -3.14159,
+        3.14159
+      ],
+      [
+        -3.14159,
+        3.14159
+      ],
+      [
+        -3.14159,
+        3.14159
+      ],
+      [
+        -3.14159,
+        3.14159
+      ],
+      [
+        -3.14159,
+        3.14159
+      ]
+    ],
+    "action_bound": 0.03,
+    "target_pos_range": {
+      "x": [
+        0.3,
+        1.2
+      ],
+      "y": [
+        -0.8,
+        0.8
+      ],
+      "z": [
+        0.1,
+        1.2
+      ]
+    }
+  },
+  "ppo": {
+    "lr_actor": 0.0001,
+    "lr_critic": 0.0001,
+    "clip_eps": 0.2,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "entropy_coef": 0.01,
+    "value_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "epochs": 10,
+    "batch_size": 64
+  },
+  "reward": {
+    "accuracy": {
+      "weight": 0.1,
+      "sigma": 0.1,
+      "threshold": 0.005
+    },
+    "smoothness": {
+      "weight": 0.1,
+      "lambda_vel": 1.0,
+      "lambda_acc": 0.5
+    },
+    "energy": {
+      "weight": 0.01
+    },
+    "extra": {
+      "success_reward": 10.0
+    }
+  },
+  "decay_episode": {
+    "enabled": true,
+    "initial_max_steps": 1000,
+    "min_max_steps": 200,
+    "success_threshold": 0.7,
+    "decay_window": 200,
+    "decay_step_size": 50
+  },
+  "train": {
+    "max_episodes": 50000,
+    "save_interval": 500,
+    "log_interval": 100,
+    "eval_interval": 1000,
+    "rollout_length": 1000,
+    "checkpoint_dir": "./checkpoints"
+  },
+  "value_normalization": {
+    "enabled": true,
+    "beta": 0.995,
+    "epsilon": 1e-08,
+    "clip_range": 10.0
+  },
+  "evaluation": {
+    "enabled": true,
+    "eval_episodes": 100,
+    "success_threshold": 0.005,
+    "metrics": [
+      "success_rate",
+      "avg_episode_length",
+      "avg_reward",
+      "trajectory_smoothness",
+      "final_position_error"
+    ]
+  },
+  "logging": {
+    "use_tensorboard": false,
+    "tensorboard_dir": "./logs",
+    "save_csv": true,
+    "csv_dir": "./csv_output",
+    "save_plots": true,
+    "plot_dir": "./plots",
+    "save_trajectories": true,
+    "trajectory_dir": "./trajectories"
+  },
+  "seed": 42,
+  "device": {
+    "gpu_id": 0,
+    "use_cuda": true
+  },
+  "debug": {
+    "verbose": true,
+    "save_debug_info": false,
+    "debug_dir": "./debug_output"
+  },
+  "advanced": {
+    "gae": {
+      "enabled": true,
+      "lambda": 0.95
+    },
+    "lr_scheduler": {
+      "enabled": false,
+      "type": "cosine",
+      "T_max": 10000
+    },
+    "prioritized_replay": {
+      "enabled": false,
+      "alpha": 0.6,
+      "beta": 0.4
+    },
+    "network": {
+      "actor_hidden_layers": [
+        256,
+        256,
+        256
+      ],
+      "critic_hidden_layers": [
+        256,
+        256,
+        256
+      ],
+      "activation": "relu"
+    },
+    "regularization": {
+      "dropout_rate": 0.1,
+      "weight_decay": 0.0
+    },
+    "replay_buffer": {
+      "size": 100000
+    }
+  }
+}
