@@ -598,6 +598,193 @@ def generate_training_report(training_stats: Dict[str, List],
     print(f"📝 训练报告已保存到: {report_path}")
 
 
+class RewardNormalizer:
+    """
+    奖励归一化器
+
+    用于稳定PPO训练的奖励归一化技术，支持在线更新和多种归一化策略
+    """
+
+    def __init__(self,
+                 gamma: float = 0.99,
+                 clip_range: float = 5.0,
+                 epsilon: float = 1e-8,
+                 normalize_method: str = 'running_stats',
+                 warmup_steps: int = 100,
+                 history_size: int = 10000):
+        """
+        初始化奖励归一化器
+
+        Args:
+            gamma: 折扣因子，用于计算折扣奖励统计
+            clip_range: 归一化值裁剪范围
+            epsilon: 数值稳定性参数
+            normalize_method: 归一化方法 ['running_stats', 'batch_stats', 'rank']
+            warmup_steps: 预热步数，初期不进行归一化
+            history_size: 奖励历史记录大小
+        """
+        self.gamma = gamma
+        self.clip_range = clip_range
+        self.epsilon = epsilon
+        self.normalize_method = normalize_method
+        self.warmup_steps = warmup_steps
+        self.history_size = history_size
+
+        # 运行时统计量
+        self.running_mean = 0.0
+        self.running_var = 1.0
+        self.running_count = 0
+        self.beta = 0.99  # 指数移动平均系数
+
+        # 奖励历史
+        self.reward_history = []
+        self.discounted_reward_history = []
+
+        # 批次统计
+        self.batch_rewards = []
+
+    def update(self, reward: float, done: bool = False):
+        """
+        更新归一化器统计量
+
+        Args:
+            reward: 当前奖励值
+            done: 是否回合结束
+        """
+        self.reward_history.append(reward)
+        self.running_count += 1
+
+        # 指数移动平均更新
+        self.running_mean = self.beta * self.running_mean + (1 - self.beta) * reward
+        delta = reward - self.running_mean
+        self.running_var = self.beta * self.running_var + (1 - self.beta) * delta * delta
+
+        # 维护历史记录在合理范围内
+        if len(self.reward_history) > self.history_size:
+            self.reward_history = self.reward_history[-self.history_size//2:]
+
+        # 回合结束时计算折扣奖励统计
+        if done and len(self.reward_history) > 1:
+            self._update_discounted_stats()
+
+    def _update_discounted_stats(self):
+        """更新折扣奖励统计"""
+        if not self.reward_history:
+            return
+
+        # 计算最近一个episode的折扣奖励
+        discounted_rewards = []
+        reward_sum = 0.0
+        for reward in reversed(self.reward_history):
+            reward_sum = reward + self.gamma * reward_sum
+            discounted_rewards.append(reward_sum)
+
+        discounted_rewards.reverse()
+        self.discounted_reward_history.extend(discounted_rewards)
+
+        # 维护折扣奖励历史
+        if len(self.discounted_reward_history) > self.history_size:
+            self.discounted_reward_history = self.discounted_reward_history[-self.history_size//2:]
+
+    def normalize(self, reward: float) -> float:
+        """
+        归一化单个奖励
+
+        Args:
+            reward: 原始奖励值
+
+        Returns:
+            normalized_reward: 归一化后的奖励值
+        """
+        if self.running_count < self.warmup_steps:
+            return reward  # 预热期不归一化
+
+        if self.normalize_method == 'running_stats':
+            return self._normalize_running_stats(reward)
+        elif self.normalize_method == 'batch_stats':
+            return self._normalize_batch_stats(reward)
+        elif self.normalize_method == 'rank':
+            return self._normalize_rank(reward)
+        else:
+            return reward
+
+    def _normalize_running_stats(self, reward: float) -> float:
+        """使用运行统计量归一化"""
+        std = np.sqrt(self.running_var + self.epsilon)
+        normalized = (reward - self.running_mean) / std
+        return np.clip(normalized, -self.clip_range, self.clip_range)
+
+    def _normalize_batch_stats(self, reward: float) -> float:
+        """使用批次统计量归一化"""
+        if len(self.reward_history) < 10:
+            return reward
+
+        # 使用最近的奖励作为批次
+        recent_rewards = self.reward_history[-min(100, len(self.reward_history)):]
+        batch_mean = np.mean(recent_rewards)
+        batch_std = np.std(recent_rewards) + self.epsilon
+
+        normalized = (reward - batch_mean) / batch_std
+        return np.clip(normalized, -self.clip_range, self.clip_range)
+
+    def _normalize_rank(self, reward: float) -> float:
+        """使用秩归一化（均匀分布）"""
+        if len(self.reward_history) < 10:
+            return reward
+
+        # 计算当前奖励在历史中的百分位
+        count_smaller = sum(1 for r in self.reward_history if r < reward)
+        percentile = count_smaller / len(self.reward_history)
+
+        # 映射到[-1, 1]范围
+        normalized = 2 * percentile - 1
+        return np.clip(normalized, -self.clip_range, self.clip_range)
+
+    def normalize_batch(self, rewards: np.ndarray) -> np.ndarray:
+        """
+        批量归一化奖励
+
+        Args:
+            rewards: [batch_size] 奖励数组
+
+        Returns:
+            normalized_rewards: 归一化后的奖励数组
+        """
+        if self.running_count < self.warmup_steps:
+            return rewards
+
+        normalized_rewards = np.array([self.normalize(r) for r in rewards])
+        return normalized_rewards
+
+    def get_stats(self) -> dict:
+        """获取归一化器统计信息"""
+        return {
+            'method': self.normalize_method,
+            'running_mean': self.running_mean,
+            'running_var': self.running_var,
+            'running_std': np.sqrt(self.running_var + self.epsilon),
+            'count': self.running_count,
+            'recent_mean': np.mean(self.reward_history[-100:]) if self.reward_history else 0.0,
+            'recent_std': np.std(self.reward_history[-100:]) if len(self.reward_history) > 1 else 0.0,
+            'history_size': len(self.reward_history),
+            'warmup_progress': min(1.0, self.running_count / self.warmup_steps)
+        }
+
+    def reset(self):
+        """重置归一化器（保留学习到的统计量）"""
+        self.reward_history = []
+        self.batch_rewards = []
+
+    def full_reset(self):
+        """完全重置归一化器"""
+        self.reward_history = []
+        self.discounted_reward_history = []
+        self.batch_rewards = []
+        self.running_mean = 0.0
+        self.running_var = 1.0
+        self.running_count = 0
+
+
 class TrainingLogger:
     """训练日志记录器"""
 

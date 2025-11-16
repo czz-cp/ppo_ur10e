@@ -12,7 +12,7 @@ UR10e PPO 多目标最优轨迹规划环���
 - d_e: 当前位置与目标���置的欧氏距离（1维）
 
 动作空间设计（6维）：
-- 关节角速度 \dot{θ}（6维）
+- 关节角速度 \\dot{θ}（6维）
 
 奖励函数设计：
 r(s_t, a_t) = r_a^t + r_s^t + r_e^t + r_ex^t
@@ -33,6 +33,7 @@ from scipy.spatial.transform import Rotation as R
 import math
 from typing import Tuple, Dict, Any, Optional
 from ur10e_kinematics_fixed import UR10eKinematicsFixed
+from utils import RewardNormalizer
 
 
 class UR10ePPOEnv:
@@ -42,7 +43,7 @@ class UR10ePPOEnv:
     实现论文中的25维状态空间设计和多目标奖励函数
     """
 
-    def __init__(self, xml_path: str = './universal_robots_ur10e/ur10e_mujoco/scene.xml',
+    def __init__(self, xml_path: str = '../universal_robots_ur10e/ur10e_mujoco/scene.xml',
                  max_steps: int = 1000, enable_rendering: bool = False, config: Dict = None):
         # 基础参数
         self.xml_path = xml_path
@@ -132,12 +133,38 @@ class UR10ePPOEnv:
         # 历史数据（用于计算加速度）
         self.joint_history = []
 
+        # 奖励归一化器
+        self.reward_normalizer = RewardNormalizer(
+            gamma=0.99,
+            clip_range=5.0,
+            normalize_method='running_stats',
+            warmup_steps=100
+        )
+
         # 初始化运动学解算器
         # 初始化运动学 - 使用官方UR代码实现
         self.kinematics = UR10eKinematicsFixed()
 
         # 初始���环境
         self._init_environment()
+
+        # 设置gym接口属性
+        class ActionSpace:
+            def __init__(self):
+                self.shape = (3,)
+                self.high = np.array([0.5, 0.5, 1.0])
+                self.low = np.array([-0.5, -0.5, 0.0])
+
+            def sample(self):
+                return np.random.uniform(self.low, self.high)
+
+        self.action_space = ActionSpace()
+
+        self.observation_space = type('ObservationSpace', (), {
+            'shape': (16,),
+            'high': np.full(16, 1.0),
+            'low': np.full(16, -1.0)
+        })()
 
     def _init_environment(self):
         """初始化MuJoCo环境"""
@@ -262,23 +289,21 @@ class UR10ePPOEnv:
         if not hasattr(self, 'error_integral'):
             self.error_integral = np.zeros(6)
 
-        # 基于当前位置到目标位置的启发式控制
-        # 使用雅可比的近似版本：将末端位置误差映射到关节误差
+        # 基于雅可比的精确控制
         if hasattr(self, 'target_pos') and self.target_pos is not None:
             current_end_pos = self.data.site_xpos[0].copy()
             end_effector_error = self.target_pos - current_end_pos
 
-            # 简化的雅可比映射：将末端误差分配到各关节
-            # 这是一个启发式方法，实际应用中可以使用更精确的雅可比计算
-            position_error = np.zeros(6)
+            # 使用雅可比矩阵将任务空间误差映射到关节空间
+            # 计算当前位形的雅可比矩阵
+            jacobian = self._compute_jacobian(current_angles)
 
-            # 将XYZ误差映射到关节空间（简化的启发式映射）
-            position_error[0] = end_effector_error[0] * 0.5  # shoulder_pan
-            position_error[1] = end_effector_error[1] * 0.5  # shoulder_lift
-            position_error[2] = end_effector_error[2] * 0.5  # elbow
-            position_error[3] = (end_effector_error[0] + end_effector_error[1]) * 0.3  # wrist_1
-            position_error[4] = (end_effector_error[1] + end_effector_error[2]) * 0.3  # wrist_2
-            position_error[5] = np.linalg.norm(end_effector_error) * 0.2  # wrist_3
+            # 使用雅可比转置法：q_error = J^T @ task_error
+            # 这将末端执行器的笛卡尔空间误差转换为关节空间误差
+            position_error = jacobian.T @ end_effector_error
+
+            # 确保关节误差在合理范围内
+            position_error = np.clip(position_error, -1.0, 1.0)
         else:
             # 如果没有目标，只做阻尼控制
             position_error = np.zeros(6)
@@ -316,6 +341,90 @@ class UR10ePPOEnv:
             )
 
         return control_torques
+
+    def _compute_jacobian(self, joint_angles: np.ndarray, epsilon: float = 1e-6) -> np.ndarray:
+        """
+        计算UR10e机器人的雅可比矩阵 (6x3)
+
+        使用数值微分方法计算雅可比矩阵，将关节空间速度映射到任务空间速度
+
+        Args:
+            joint_angles: 当前关节角度 [6]
+            epsilon: 数值微分的步长
+
+        Returns:
+            jacobian: 6x3 雅可比矩阵 J，其中 v_task = J @ q_dot
+        """
+        # 获取当前末端执行器位置和姿态
+        current_pos = self._get_end_effector_position(joint_angles)
+
+        # 初始化雅可比矩阵 (3x6 for position only)
+        jacobian = np.zeros((3, 6))
+
+        # 数值微分计算位置雅可比
+        for i in range(6):
+            # 创建微小的扰动
+            delta_q = np.zeros(6)
+            delta_q[i] = epsilon
+
+            # 计算扰动后的位置
+            perturbed_pos = self._get_end_effector_position(joint_angles + delta_q)
+
+            # 计算差分
+            pos_diff = perturbed_pos - current_pos
+
+            # 雅可比元素 = dX/dq_i
+            jacobian[:, i] = pos_diff / epsilon
+
+        return jacobian
+
+    def _get_end_effector_position(self, joint_angles: np.ndarray) -> np.ndarray:
+        """
+        获取给定关节角度下的末端执行器位置
+
+        Args:
+            joint_angles: 关节角度 [6]
+
+        Returns:
+            position: 末端执行器位置 [x, y, z]
+        """
+        # 保存当前状态
+        original_qpos = self.data.qpos.copy()
+
+        # 临时设置关节角度
+        self.data.qpos[:6] = joint_angles
+        mj.mj_forward(self.model, self.data)
+
+        # 获取末端执行器位置
+        end_pos = self.data.site_xpos[0].copy()
+
+        # 恢复原始状态
+        self.data.qpos[:] = original_qpos
+        mj.mj_forward(self.model, self.data)
+
+        return end_pos
+
+    def get_reward_normalizer_stats(self) -> Dict[str, Any]:
+        """
+        获取奖励归一化器的统计信息
+
+        Returns:
+            stats: 归一化器统计信息
+        """
+        return self.reward_normalizer.get_stats()
+
+    def set_reward_normalization_method(self, method: str):
+        """
+        设置奖励归一化方法
+
+        Args:
+            method: 归一化方法 ['running_stats', 'batch_stats', 'rank']
+        """
+        if method in ['running_stats', 'batch_stats', 'rank']:
+            self.reward_normalizer.normalize_method = method
+            print(f"✅ 奖励归一化方法已设置为: {method}")
+        else:
+            print(f"❌ 不支持的归一化方法: {method}")
 
     def _compute_hybrid_control_reward(self, action: np.ndarray, current_angles: np.ndarray,
                                      current_velocities: np.ndarray, current_end_pos: np.ndarray,
@@ -502,6 +611,9 @@ class UR10ePPOEnv:
         self.prev_joint_angles = self.start_joint_angles.copy()
         self.prev_joint_velocities = np.zeros(6)
         self.joint_history = [self.start_joint_angles.copy()]
+
+        # 重置奖励归一化器（保留学习到的统计量）
+        self.reward_normalizer.reset()
 
         return self._get_state()
 
@@ -703,10 +815,18 @@ class UR10ePPOEnv:
         current_end_pos = self.data.site_xpos[0].copy()
 
         # 计算奖励（使用混合控制奖励函数）
-        reward, reward_components = self._compute_hybrid_control_reward(
+        raw_reward, reward_components = self._compute_hybrid_control_reward(
             action, current_joint_angles, current_joint_velocities,
             current_end_pos, self.target_pos
         )
+
+        # 奖励归一化
+        self.reward_normalizer.update(raw_reward, done=False)
+        reward = self.reward_normalizer.normalize(raw_reward)
+
+        # 保存原始奖励到info中用于调试
+        reward_components['raw_reward'] = raw_reward
+        reward_components['normalized_reward'] = reward
 
         # RL调度PID参数的控制器
         control_torques = self._rl_pid_control(
@@ -735,6 +855,10 @@ class UR10ePPOEnv:
         # 计算结束条件
         pos_error = np.linalg.norm(self.data.site_xpos[0] - self.target_pos)
         done = self._should_terminate(pos_error)
+
+        # 通知奖励归一化器回合结束
+        if done:
+            self.reward_normalizer.update(0.0, done=True)  # 使用0值触发done处理
 
         # 更新步数
         self.current_step += 1
